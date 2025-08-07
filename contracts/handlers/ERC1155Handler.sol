@@ -3,20 +3,16 @@ pragma experimental ABIEncoderV2;
 
 import "../interfaces/IDepositExecute.sol";
 import "./HandlerHelpers.sol";
-import "../ERC721Safe.sol";
+import "../ERC1155Safe.sol";
 import "@openzeppelin/contracts/introspection/ERC165Checker.sol";
-import "@openzeppelin/contracts/token/ERC721/IERC721Metadata.sol";
-
 
 /**
-    @title Handles ERC721 deposits and deposit executions.
+    @title Handles ERC1155 deposits and deposit executions.
     @author ChainSafe Systems.
     @notice This contract is intended to be used with the Bridge contract.
  */
-contract ERC721Handler is IDepositExecute, HandlerHelpers, ERC721Safe {
+contract ERC1155Handler is IDepositExecute, HandlerHelpers, ERC1155Safe {
     using ERC165Checker for address;
-
-    bytes4 private constant _INTERFACE_ERC721_METADATA = 0x5b5e139f;
 
     struct DepositRecord {
         address _tokenAddress;
@@ -25,7 +21,8 @@ contract ERC721Handler is IDepositExecute, HandlerHelpers, ERC721Safe {
         bytes   _destinationRecipientAddress;
         address _depositer;
         uint    _tokenID;
-        bytes   _metaData;
+        uint    _amount;
+        bytes   _extraData;
     }
 
     // destId => depositNonce => Deposit Record
@@ -72,8 +69,9 @@ contract ERC721Handler is IDepositExecute, HandlerHelpers, ERC721Safe {
         - _resourceID ResourceID used when {deposit} was executed.
         - _destinationRecipientAddress Address tokens are intended to be deposited to on desitnation chain.
         - _depositer Address that initially called {deposit} in the Bridge contract.
-        - _tokenID ID of ERC721.
-        - _metaData Optional ERC721 metadata.
+        - _tokenID ID of ERC1155.
+        - _amount Amount of tokenID to transfer.
+        - _extraData Optional data field supported by ERC1155
     */
     function getDepositRecord(uint64 depositNonce, uint8 destId) external view returns (DepositRecord memory) {
         return _depositRecords[destId][depositNonce];
@@ -88,10 +86,12 @@ contract ERC721Handler is IDepositExecute, HandlerHelpers, ERC721Safe {
         and {destinationRecipientAddress} all padded to 32 bytes.
         @notice Data passed into the function should be constructed as follows:
         tokenID                                     uint256    bytes    0  - 32
-        destinationRecipientAddress     length      uint256    bytes    32 - 64
-        destinationRecipientAddress                   bytes    bytes    64 - (64 + len(destinationRecipientAddress))
-        @notice If the corresponding {tokenAddress} for the parsed {resourceID} supports {_INTERFACE_ERC721_METADATA},
-        then {metaData} will be set according to the {tokenURI} method in the token contract.
+        amount                                      uint256    bytes    32 - 64
+        destinationRecipientAddress     length      uint256    bytes    64 - 96
+        extraData                       length      uint256    bytes    96 - 128
+        destinationRecipientAddress                   bytes    bytes    128 - x where x = (128 + len(destinationRecipientAddress))
+        extraData                                     bytes    bytes    x  - (x + len(extraData))
+
         @dev Depending if the corresponding {tokenAddress} for the parsed {resourceID} is
         marked true in {_burnList}, deposited tokens will be burned, if not, they will be locked.
      */
@@ -101,27 +101,32 @@ contract ERC721Handler is IDepositExecute, HandlerHelpers, ERC721Safe {
                     address     depositer,
                     bytes       calldata data
                     ) external override onlyBridge {
+        // payload data
         uint         tokenID;
+        uint         amount;
         uint         lenDestinationRecipientAddress;
+        uint         lenExtraData;
         bytes memory destinationRecipientAddress;
-        bytes memory metaData;
+        bytes memory extraData;
+        
+        // intermediate values
+        uint         byteOffset;
 
-        (tokenID, lenDestinationRecipientAddress) = abi.decode(data, (uint, uint));
-        destinationRecipientAddress = bytes(data[64:64 + lenDestinationRecipientAddress]);
+        (tokenID, amount, lenDestinationRecipientAddress, lenExtraData) = abi.decode(data, (uint, uint, uint, uint));
+
+        byteOffset = 128;
+        destinationRecipientAddress = bytes(data[byteOffset:byteOffset + lenDestinationRecipientAddress]);
+
+        byteOffset += lenDestinationRecipientAddress;
+        extraData = bytes(data[byteOffset:byteOffset + lenExtraData]);
 
         address tokenAddress = _resourceIDToTokenContractAddress[resourceID];
         require(_contractWhitelist[tokenAddress], "provided tokenAddress is not whitelisted");
 
-        // Check if the contract supports metadata, fetch it if it does
-        if (tokenAddress.supportsInterface(_INTERFACE_ERC721_METADATA)) {
-            IERC721Metadata erc721 = IERC721Metadata(tokenAddress);
-            metaData = bytes(erc721.tokenURI(tokenID));
-        }
-
         if (_burnList[tokenAddress]) {
-            burnERC721(tokenAddress, tokenID);
+            burnERC1155(tokenAddress, depositer, tokenID, amount);
         } else {
-            lockERC721(tokenAddress, depositer, address(this), tokenID);
+            lockERC1155(tokenAddress, depositer, address(this), tokenID, amount, extraData);
         }
 
         _depositRecords[destinationChainID][depositNonce] = DepositRecord(
@@ -131,35 +136,43 @@ contract ERC721Handler is IDepositExecute, HandlerHelpers, ERC721Safe {
             destinationRecipientAddress,
             depositer,
             tokenID,
-            metaData
+            amount,
+            extraData
         );
     }
 
     /**
         @notice Proposal execution should be initiated when a proposal is finalized in the Bridge contract.
         by a relayer on the deposit's destination chain.
-        @param data Consists of {tokenID}, {resourceID}, {lenDestinationRecipientAddress},
-        {destinationRecipientAddress}, {lenMeta}, and {metaData} all padded to 32 bytes.
+        @param data Consists of {tokenID}, {resourceID}, {lenDestinationRecipientAddress}, {lenExtraData}
+        {destinationRecipientAddress}, and {extraData} all padded to 32 bytes.
         @notice Data passed into the function should be constructed as follows:
-        tokenID                                     uint256    bytes    0  - 32
-        destinationRecipientAddress     length      uint256    bytes    32 - 64
-        destinationRecipientAddress                   bytes    bytes    64 - (64 + len(destinationRecipientAddress))
-        metadata                        length      uint256    bytes    (64 + len(destinationRecipientAddress)) - (64 + len(destinationRecipientAddress) + 32)
-        metadata                                      bytes    bytes    (64 + len(destinationRecipientAddress) + 32) - END
+        tokenID                                     uint256    bytes    0   - 32
+        amount                                      uint256    bytes    32  - 64
+        destinationRecipientAddress     length      uint256    bytes    64  - 96
+        extraData                       length      uint256    bytes    96  - 128
+        destinationRecipientAddress                   bytes    bytes    128 - x where x = (128 + len(destinationRecipientAddress))
+        extraData                                     bytes    bytes    x   - y where y = (x + len(extraData))
      */
     function executeProposal(bytes32 resourceID, bytes calldata data) external override onlyBridge {
+        // payload
         uint         tokenID;
+        uint         amount;
         uint         lenDestinationRecipientAddress;
+        uint         lenExtraData;
         bytes memory destinationRecipientAddress;
-        uint         offsetMetaData;
-        uint         lenMetaData;
-        bytes memory metaData;
+        bytes memory extraData;
 
-        (tokenID, lenDestinationRecipientAddress) = abi.decode(data, (uint, uint));
-        offsetMetaData = 64 + lenDestinationRecipientAddress;
-        destinationRecipientAddress = bytes(data[64:offsetMetaData]);
-        lenMetaData = abi.decode(data[offsetMetaData:], (uint));
-        metaData = bytes(data[offsetMetaData + 32:offsetMetaData + 32 + lenMetaData]);
+        // intermediate variables
+        uint         byteOffset;
+
+        (tokenID, amount, lenDestinationRecipientAddress, lenExtraData) = abi.decode(data, (uint, uint, uint, uint));
+        
+        byteOffset = 128;
+        destinationRecipientAddress = bytes(data[byteOffset:byteOffset + lenDestinationRecipientAddress]);
+
+        byteOffset += lenDestinationRecipientAddress;
+        extraData = bytes(data[byteOffset:byteOffset + lenExtraData]);
 
         bytes20 recipientAddress;
 
@@ -171,24 +184,27 @@ contract ERC721Handler is IDepositExecute, HandlerHelpers, ERC721Safe {
         require(_contractWhitelist[address(tokenAddress)], "provided tokenAddress is not whitelisted");
 
         if (_burnList[tokenAddress]) {
-            mintERC721(tokenAddress, address(recipientAddress), tokenID, metaData);
+            mintERC1155(tokenAddress, address(recipientAddress), tokenID, amount, extraData);
         } else {
-            releaseERC721(tokenAddress, address(this), address(recipientAddress), tokenID);
+            releaseERC1155(tokenAddress, address(this), address(recipientAddress), tokenID, amount, extraData);
         }
     }
 
     /**
-        @notice Used to manually release ERC721 tokens from ERC721Safe.
+        @notice Used to manually release ERC1155 tokens from ERC1155Safe.
         @param tokenAddress Address of token contract to release.
         @param recipient Address to release token to.
-        @param tokenID The ERC721 token ID to release.
+        @param tokenID The ERC1155 token ID to release.
+        @param amount Amount of tokenID to release.
+        @param extraData The data parameter required by ERC 1155 on transfer.
      */
-    function withdraw(address tokenAddress, address recipient, uint tokenID) external override onlyBridge {
-        releaseERC721(tokenAddress, address(this), recipient, tokenID);
+    function withdraw(address tokenAddress, address recipient, uint tokenID, uint amount, bytes memory extraData) external override onlyBridge {
+        releaseERC1155(tokenAddress, address(this), recipient, tokenID, amount, extraData);
     }
 
-    // Support new withdraw signature: amount and extraData are ignored.
-    function withdraw(address tokenAddress, address recipient, uint tokenID, uint256 amount, bytes memory extraData) external override onlyBridge {
-        this.withdraw(tokenAddress, recipient, tokenID);
+    // ERC1155 transfers aren't supported by the old withdraw() signature.
+    // Revert because we don't have enough info for the transfer. 
+    function withdraw(address tokenAddress, address recipient, uint256 amountOrTokenID) external override onlyBridge {
+      revert("Wrong withdraw() signature called; use other signature");
     }
 }
